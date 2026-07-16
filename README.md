@@ -69,6 +69,10 @@ new_state, y = forward(state, jnp.ones((3, 4)))
   static×scoped grid, custom namespaces, and tied weights.
 - [Transforms](docs/guide/transforms.md) — why `forward` needs no wrappers under
   `jit` / `vmap` / `scan` / `grad` / `remat`.
+- [Combinators](docs/guide/combinators.md) — `sequential` / `repeat` / `parallel`,
+  bare-callable passthrough, `ClassName_N` naming, and weight-tied `repeat`.
+- [Training](docs/guide/training.md) — the end-to-end optax loop: params-only
+  gradients, threading buffers, train/eval flags, and selective `freeze`.
 
 The full interface is specified in [`docs/api-contract.md`](docs/api-contract.md)
 (frozen v1).

@@ -1,17 +1,17 @@
-"""Embedding layer (contract §3, Task A). STUB — implemented in Phase 2."""
+"""Embedding layer (contract §3, Task A)."""
 
 from __future__ import annotations
 
-from typing import Any
+import jax
 
 from ..module import Module
 
 
 class Embedding(Module):
-    """`E[x]` over an `(vocab, d)` table. STUB — implemented in Phase 2, Task A."""
+    """Lookup table `E[x]` over a `(vocab, d)` matrix (contract §3)."""
 
     def __init__(self, vocab: int, d: int) -> None:
-        raise NotImplementedError("layers.Embedding — Phase 2, Task A")
+        self.E = jax.random.normal(self.key(), (vocab, d)) * 0.01
 
-    def __call__(self, x: Any) -> Any:
-        raise NotImplementedError("layers.Embedding — Phase 2, Task A")
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.E[x]

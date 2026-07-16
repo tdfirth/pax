@@ -1,17 +1,19 @@
-"""Linear layer (contract §3, Task A). STUB — implemented in Phase 2."""
+"""Linear layer (contract §3, Task A)."""
 
 from __future__ import annotations
 
-from typing import Any
+import jax
+import jax.numpy as jnp
 
 from ..module import Module
 
 
 class Linear(Module):
-    """`x @ W + b`. STUB — implemented in Phase 2, Task A."""
+    """Affine map `x @ W + b` (contract §3)."""
 
     def __init__(self, in_features: int, out_features: int) -> None:
-        raise NotImplementedError("layers.Linear — Phase 2, Task A")
+        self.W = jax.random.normal(self.key(), (in_features, out_features)) * 0.01
+        self.b = jnp.zeros(out_features)
 
-    def __call__(self, x: Any) -> Any:
-        raise NotImplementedError("layers.Linear — Phase 2, Task A")
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return x @ self.W + self.b

@@ -348,6 +348,7 @@ bound (len(_bound) > 0)          -> forward-time WRITE: record under the
                                     registered namespace of `name` (D3: raise if
                                     unregistered); do not touch the instance
 unbound (init):
+    name shadows a Module method -> raise ValueError (guard G4)
     value is Module              -> _children[name]=value  (guards G1, G2)
     value is Tagged              -> registry[name]=value.ns; _init_values[name]=value.value  (guard G2)
     value is jax.Array           -> registry[name]='params'; _init_values[name]=value  (guard G2)
@@ -379,6 +380,11 @@ slice) — the same failure class D3 exists to prevent. So init-time raises earl
   silent config attribute: absent from `state`, untraced, no gradients. Assign a
   JAX array (`jnp.*` / `jax.random.*`, seeded via `self.key()`) or tag it for a
   namespace. Genuine config (`int`/`float`/`str`/`tuple`) is unaffected.
+- **G4 — reserved-name shadowing.** Assigning an attribute whose name shadows a
+  `Module` method/attribute (`key`, `rng`, `state`, `forward`, …) raises. A state
+  attribute by that name would be masked on read by the class method (normal
+  attribute lookup wins over `__getattr__`), so e.g. an `rng` leaf must be named
+  anything but `rng` (`self.dropout_key = rng(self.key())`). Choose another name.
 
 Double-tagging (`buffer(buffer(x))`) likewise raises at the tagger (§2.1), so a
 `Tagged` never becomes another namespace's stored *value*.
@@ -613,6 +619,9 @@ result into an early raise (§5.2):
 - **G2** — reusing an attribute **name across param/child categories raises**.
 - **G3** — assigning a **non-jax array-like** (NumPy `ndarray`/scalar) as a
   weight **raises**; use a `jax.Array` or a namespace tagger.
+- **G4** — assigning an attribute whose **name shadows a `Module` method**
+  (`key`/`rng`/`state`/`forward`/…) **raises**; the method would mask the state
+  attribute on read (so an `rng` leaf must not be named `rng`).
 - **`state(key=...)`** re-materializes by replaying construction; it **raises**
   for modules built from pre-existing child instances (combinators, child-arg
   ctors) instead of returning stale values (§4).

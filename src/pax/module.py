@@ -61,6 +61,12 @@ class Module:
         if self._bound:
             self._record_write(name, value)
             return
+        if hasattr(type(self), name):
+            raise ValueError(
+                f"{name!r} shadows a Module method/attribute (e.g. key, rng, "
+                f"state, forward); a state attribute by that name would be masked "
+                f"on read. Choose another name."
+            )
         if isinstance(value, Module):
             self._assign_child(name, value)
         elif isinstance(value, Tagged):

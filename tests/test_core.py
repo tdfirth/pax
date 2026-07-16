@@ -379,6 +379,14 @@ def test_double_tagging_raises():
         buffer(buffer(jnp.zeros(3)))
 
 
+def test_attr_shadowing_a_method_raises():
+    with pax.seed(0):
+        m = Model.__new__(Model)
+    for reserved in ("rng", "key", "state", "forward"):
+        with pytest.raises(ValueError, match="shadows a Module"):
+            setattr(m, reserved, jnp.zeros(3))
+
+
 def test_numpy_weight_raises_not_silently_config():
     import numpy as np
 

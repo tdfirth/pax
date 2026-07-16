@@ -68,3 +68,26 @@ def test_state_key_rematerializes_deterministically():
     assert jnp.array_equal(a["W"], b["W"])
     # Different from the construction-time values.
     assert not jnp.array_equal(a["W"], model.state()["params"]["W"])
+
+
+class MLP(Module):
+    def __init__(self, i: int, h: int, o: int) -> None:
+        self.l1 = Linear(i, h)
+        self.l2 = Linear(h, o)
+
+    def __call__(self, x):
+        return self.l2(jax.nn.relu(self.l1(x)))
+
+
+def test_state_key_rematerializes_nested_children():
+    """Re-materialization must redraw every child built inside __init__ (#5a)."""
+    with pax.seed(0):
+        model = MLP(4, 8, 2)
+    k = jax.random.key(7)
+    remat = model.state(key=k)["params"]
+    base = model.state()["params"]
+    assert not jnp.array_equal(remat["l1"]["W"], base["l1"]["W"])
+    assert not jnp.array_equal(remat["l2"]["W"], base["l2"]["W"])
+    # Deterministic given the same key.
+    again = model.state(key=k)["params"]
+    assert jnp.array_equal(remat["l1"]["W"], again["l1"]["W"])

@@ -102,10 +102,15 @@ class _Repeat(Module):
 
     def _writeback(self, child: Module, final: dict[str, Any]) -> None:
         frame = child._bound[-1]
+        writes = child._writes[-1]
         for ns, value in final.items():
-            if not spec_of(ns).scoped:
-                continue
-            frame[ns] = value.data if isinstance(value, Static) else value
+            data = value.data if isinstance(value, Static) else value
+            if spec_of(ns).scoped:
+                frame[ns] = data
+            elif isinstance(data, dict):
+                # Global writes live in `_writes`, which `_collect_flat` reads;
+                # the scan's per-iteration frames were popped, so surface them.
+                writes.setdefault(ns, {}).update(data)
 
     def __call__(self, x: Any) -> Any:
         child = getattr(self, self.child_name)

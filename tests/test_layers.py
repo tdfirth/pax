@@ -153,6 +153,28 @@ def test_attention_shape():
     assert y.shape == (7, 16)
 
 
+def test_attention_matches_reference():
+    """Value check against a from-scratch multi-head attention (not just shape)."""
+    d, heads, seq = 16, 4, 7
+    model = build(Attention, d, heads)
+    state = model.state()
+    x = jax.random.normal(jax.random.key(5), (seq, d))
+    _, y = model.forward(state, x)
+
+    p = state["params"]
+    dh = d // heads
+
+    def heads_of(m):
+        return x @ m  # (seq, d)
+
+    q, k, v = heads_of(p["Wq"]), heads_of(p["Wk"]), heads_of(p["Wv"])
+    q, k, v = (t.reshape(seq, heads, dh).transpose(1, 0, 2) for t in (q, k, v))
+    scores = q @ k.swapaxes(-1, -2) / jnp.sqrt(dh)
+    ctx = jax.nn.softmax(scores, axis=-1) @ v
+    ref = ctx.transpose(1, 0, 2).reshape(seq, d) @ p["Wo"]
+    assert jnp.allclose(y, ref, atol=1e-5)
+
+
 def test_attention_under_jit():
     model = build(Attention, 16, 4)
     state = model.state()

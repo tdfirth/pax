@@ -46,7 +46,6 @@ def test_is_namespace():
 
 
 def test_builtins_have_expected_specs():
-    assert spec_of("params") == spec_of("params")
     assert spec_of("params").scoped and not spec_of("params").static
     assert spec_of("buffers").scoped and not spec_of("buffers").static
     assert not spec_of("flags").scoped and spec_of("flags").static

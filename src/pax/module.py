@@ -61,16 +61,46 @@ class Module:
         if self._bound:
             self._record_write(name, value)
             return
-        if isinstance(value, Tagged):
-            self._registry[name] = value.ns
-            self._init_values[name] = value.value
-        elif isinstance(value, Module):
-            self._children[name] = value
+        if isinstance(value, Module):
+            self._assign_child(name, value)
+        elif isinstance(value, Tagged):
+            self._assign_registered(name, value.ns, value.value)
         elif isinstance(value, jax.Array):
-            self._registry[name] = "params"
-            self._init_values[name] = value
+            self._assign_registered(name, "params", value)
+        elif hasattr(value, "__array__"):
+            raise TypeError(
+                f"{name!r} is a {type(value).__name__}, not a jax.Array; assign a "
+                f"JAX array (jnp.* / jax.random.*, seeded via self.key()) for a "
+                f"weight, or wrap it with a namespace tagger. Plain config "
+                f"(int/float/str/tuple) is stored as-is."
+            )
         else:
             object.__setattr__(self, name, value)
+
+    def _assign_child(self, name: str, child: Module) -> None:
+        for other, existing in self._children.items():
+            if existing is child and other != name:
+                raise ValueError(
+                    f"module instance is already assigned as {other!r}; assigning "
+                    f"the same instance to {name!r} would alias its state. Tie "
+                    f"weights via a global namespace (e.g. shared), not instance "
+                    f"reuse; repeat a layer with pax.repeat."
+                )
+        if name in self._registry:
+            raise ValueError(
+                f"{name!r} is already a {self._registry[name]!r} attribute; "
+                f"cannot also assign it as a child module."
+            )
+        self._children[name] = child
+
+    def _assign_registered(self, name: str, ns: str, value: Any) -> None:
+        if name in self._children:
+            raise ValueError(
+                f"{name!r} is already a child module; cannot also assign it as a "
+                f"{ns!r} attribute."
+            )
+        self._registry[name] = ns
+        self._init_values[name] = value
 
     def _record_write(self, name: str, value: Any) -> None:
         """Forward-time write: record under the attr's registered namespace.
@@ -149,12 +179,21 @@ class Module:
         """
         if key is not None:
             args, kwargs = self._ctor
+            if _has_module(args) or _has_module(kwargs):
+                raise ValueError(
+                    "state(key=...) cannot re-materialize a module built from "
+                    "pre-existing child instances (combinators like sequential / "
+                    "repeat / parallel, or any module taking a Module argument): "
+                    "replaying construction would reuse those children, so their "
+                    "params would not be redrawn. Rebuild the whole model under "
+                    "`with pax.seed(...)` instead."
+                )
             with _use_key(key):
                 return type(self)(*args, **kwargs).state()
         used = self._used_namespaces()
         used.add("params")  # always present (contract §1)
         state: dict[str, Any] = {}
-        for ns in used:
+        for ns in sorted(used):
             spec = spec_of(ns)
             slice_ = (
                 self._init_flat(ns, {})
@@ -275,6 +314,17 @@ class Module:
         raise NotImplementedError(
             f"{type(self).__name__} must define __call__(self, x)"
         )
+
+
+def _has_module(obj: Any) -> bool:
+    """Whether a constructor argument (possibly nested) contains a `Module`."""
+    if isinstance(obj, Module):
+        return True
+    if isinstance(obj, tuple | list):
+        return any(_has_module(o) for o in obj)
+    if isinstance(obj, dict):
+        return any(_has_module(o) for o in obj.values())
+    return False
 
 
 class _NamespaceView:

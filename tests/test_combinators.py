@@ -15,7 +15,9 @@ import jax.numpy as jnp
 import pax
 from pax import parallel, repeat, sequential
 from pax.module import Module
-from pax.namespaces import Static, buffer, flags
+from pax.namespaces import Static, buffer, flags, namespace
+
+metrics = namespace("metrics", scoped=False)  # traced, global — a step counter
 
 
 class Linear(Module):
@@ -259,3 +261,27 @@ def test_parallel_under_jit():
     _, jitted = jax.jit(model.forward)(state, x)
     assert jnp.allclose(eager[0], jitted[0])
     assert jnp.allclose(eager[1], jitted[1])
+
+
+# -- repeat surfaces global-namespace writes (review #2) ----------------------
+
+
+class Counter(Module):
+    """Writes a GLOBAL namespace each call — the case repeat previously dropped."""
+
+    def __init__(self, d: int) -> None:
+        self.w = jnp.ones(d)
+        self.step = metrics(jnp.zeros(()))
+
+    def __call__(self, x):
+        self.step = self.metrics.step + 1.0
+        return x + self.w
+
+
+def test_repeat_surfaces_global_writes():
+    model = _rep(Counter(3), 4)
+    state = model.state()
+    assert jnp.array_equal(state["metrics"]["step"], jnp.zeros(()))
+    new_state, _ = model.forward(state, jnp.zeros(3))
+    # Four tied applications each increment the global step: 0 -> 4.
+    assert jnp.array_equal(new_state["metrics"]["step"], jnp.asarray(4.0))

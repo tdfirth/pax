@@ -66,6 +66,11 @@ class Tagger:
         self.name = name
 
     def __call__(self, value: T) -> T:
+        if isinstance(value, Tagged):
+            raise TypeError(
+                f"value is already tagged for namespace {value.ns!r}; do not "
+                f"double-tag it for {self.name!r}"
+            )
         return Tagged(self.name, value)  # ty: ignore[invalid-return-type]
 
 

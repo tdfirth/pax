@@ -327,3 +327,83 @@ def test_undeclared_bare_name_raises_no_fallthrough():
     model = build(NeedsShared)
     with pytest.raises(AttributeError):
         model.forward({"params": {}, "shared": {"embed": jnp.zeros(3)}}, None)
+
+
+# -- review regressions --------------------------------------------------------
+
+
+def test_state_key_rematerializes_children_built_in_init():
+    """state(key=) re-draws params of children constructed inside __init__."""
+    model = build(Model, 4, 8)
+    base = model.state()["params"]["encoder"]["W"]
+    remat = model.state(key=jax.random.key(999))["params"]["encoder"]["W"]
+    assert not jnp.array_equal(base, remat)
+
+
+def test_state_key_raises_for_prebuilt_child_instances():
+    """A module taking a pre-built child cannot faithfully replay under a key,
+    so state(key=) must raise rather than silently return stale values (#1)."""
+
+    class Wrapper(Module):
+        def __init__(self, child: Module) -> None:
+            self.child = child
+
+        def __call__(self, x):
+            return self.child(x)
+
+    model = build(Wrapper, build(Linear, 4, 8))
+    model.state()  # keyless extraction still works
+    with pytest.raises(ValueError, match="pre-existing child instances"):
+        model.state(key=jax.random.key(1))
+
+
+def test_instance_aliasing_across_two_names_raises():
+    block = build(Linear, 4, 4)
+    with pax.seed(0):
+        parent = Model.__new__(Model)  # bare instance to assign onto
+    parent.a = block
+    with pytest.raises(ValueError, match="already assigned"):
+        parent.b = block
+
+
+def test_name_reused_across_param_and_child_raises():
+    with pax.seed(0):
+        m = Model.__new__(Model)
+    m.dup = jnp.zeros(3)  # param
+    with pytest.raises(ValueError, match="already a"):
+        m.dup = build(Linear, 4, 4)  # now a child — collision
+
+
+def test_double_tagging_raises():
+    with pytest.raises(TypeError, match="already tagged"):
+        buffer(buffer(jnp.zeros(3)))
+
+
+def test_numpy_weight_raises_not_silently_config():
+    import numpy as np
+
+    class NumpyWeight(Module):
+        def __init__(self) -> None:
+            self.W = np.zeros((3, 3))  # numpy, not jax — a silent-drop footgun
+
+        def __call__(self, x):
+            return x
+
+    with pytest.raises(TypeError, match="not a jax.Array"):
+        build(NumpyWeight)
+
+
+def test_plain_config_still_allowed():
+    class Config(Module):
+        def __init__(self) -> None:
+            self.rate = 0.01  # float config — must NOT raise
+            self.name = "cfg"
+            self.dims = (3, 4)
+            self.W = jnp.zeros(3)
+
+        def __call__(self, x):
+            return x
+
+    model = build(Config)
+    assert model.rate == 0.01
+    assert set(model.state()["params"]) == {"W"}

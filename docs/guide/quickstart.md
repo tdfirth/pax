@@ -113,3 +113,6 @@ params, opt_state, loss = train_step(params, opt_state, x, targets)
 `grads` has exactly the structure of `state["params"]`, so `optax` consumes it
 directly. If a layer also writes buffers, thread `new_state["buffers"]` back into
 the `state` you pass on the next step; the params-only gradient path is unchanged.
+See [training](training.md) for the full loop — stateful buffers, train/eval
+flags, and freezing part of the model. To compose layers, see
+[combinators](combinators.md).

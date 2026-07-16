@@ -170,6 +170,38 @@ class Module:
         self._key, sub = jax.random.split(self._key)
         return sub
 
+    def rng(self) -> PRNGKey:
+        """Split this module's forward-RNG leaf and return a fresh subkey (§7).
+
+        Forward-time only. Finds this module's single `rng` leaf by namespace,
+        reads it, writes the advanced half back into state (collected into
+        `new_state` like any buffer write), and returns the other half. The
+        read/write ride the normal `getattr`/`setattr` routing so re-entrancy
+        and collection stay correct. Seed the leaf at init with
+        `self.dropout_key = rng(self.key())` — any name but `rng` (a bare `rng`
+        attribute would shadow this method on read).
+        """
+        if not self._bound:
+            raise RuntimeError(
+                "self.rng() is forward-time only; use self.key() at init"
+            )
+        names = [n for n, ns in self._registry.items() if ns == "rng"]
+        if not names:
+            raise RuntimeError(
+                "self.rng() needs an rng leaf; declare one at init, e.g. "
+                "self.dropout_key = rng(self.key())"
+            )
+        if len(names) > 1:
+            raise RuntimeError(
+                f"self.rng() is ambiguous: module has multiple rng leaves {names!r}; "
+                f"declare exactly one"
+            )
+        name = names[0]
+        key = getattr(self, name)
+        new_key, sub = jax.random.split(key)
+        setattr(self, name, new_key)
+        return sub
+
     def state(self, *, key: PRNGKey | None = None) -> dict[str, Any]:
         """Extract a fresh state pytree (contract §4).
 

@@ -7,8 +7,9 @@ re-exported here so `from pax.layers import Linear` works once implemented.
 from __future__ import annotations
 
 from .attention import Attention
+from .dropout import Dropout
 from .embedding import Embedding
 from .linear import Linear
 from .norm import BatchNorm, LayerNorm
 
-__all__ = ["Attention", "BatchNorm", "Embedding", "LayerNorm", "Linear"]
+__all__ = ["Attention", "BatchNorm", "Dropout", "Embedding", "LayerNorm", "Linear"]

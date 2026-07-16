@@ -149,3 +149,43 @@ f(train_state, jnp.ones(4))   # reuses the first compilation
 Two flag combinations, two compilations, cached forever after. This is why flag
 values must be **hashable** (they live in `aux_data`): `bool`, `int`, `str`,
 `tuple` — the natural shape of a small, finite set of modes.
+
+## Forward-time randomness — `self.rng()` and Dropout
+
+`self.key()` is an ambient thread-local; it exists only at init and would break
+purity inside a trace. Randomness *during* `forward` is instead an explicit
+pytree leaf: declare an `rng` leaf at init, seeded from the init PRNG, and split
+it each call with `self.rng()`:
+
+```python
+class Dropout(pax.Module):
+    def __init__(self, p=0.5):
+        self.p = p
+        self.rng_key = pax.rng(self.key())   # forward-RNG leaf (any name but `rng`)
+        self.training = pax.flags(True)      # shares BatchNorm's global flag
+
+    def __call__(self, x):
+        if not self.flags.training or self.p == 0.0:
+            return x
+        keep = 1.0 - self.p
+        mask = jax.random.bernoulli(self.rng(), keep, x.shape)
+        return x * mask / keep               # inverted dropout: no eval-time scaling
+```
+
+`self.rng()` splits the leaf, writes the advanced half back into
+`new_state["rng"]` (like a buffer write), and returns a fresh subkey — so the
+mask is a **pure function of the input state**. Two consequences you rely on:
+
+- **Reproducible.** The same input `state` always yields the same mask. To draw a
+  *different* mask, **thread `new_state`** into the next call — the advanced key
+  rides the carry.
+- **Composes with every transform.** Under `jit` one state gives one mask; under
+  `scan` the mask differs per step because the key threads through the carry;
+  under `grad` it is differentiable w.r.t. `x` (gradient flows through the kept
+  units). Under `vmap`, map a batch of keys for a per-row mask
+  (`in_axes=({"params": None, "rng": 0}, None)`); a single broadcast leaf gives
+  the same mask on every row.
+
+Two caveats: declare **exactly one** `rng` leaf per module (`self.rng()` finds it
+by namespace — zero or two both raise), and **don't name it `rng`** — a bare
+`rng` attribute shadows the method. Any other name works.

@@ -22,15 +22,20 @@ Two axes, two choices each:
 
 ## The built-ins
 
-Pax ships two taggers plus the implicit `params` default:
+Pax ships three taggers plus the implicit `params` default:
 
 ```python
 import pax
 
 # bare jax.Array assignment          -> params   (traced, scoped) — always present
 pax.buffer   # = namespace('buffers')                      # traced, scoped
+pax.rng      # = namespace('rng')                          # traced, scoped — forward-RNG leaf
 pax.flags    # = namespace('flags', static=True, scoped=False)  # static, global
 ```
+
+`pax.rng` seeds a forward-time PRNG leaf (`self.dropout_key = pax.rng(self.key())`)
+that `self.rng()` splits during `forward`; see
+[transforms — forward-time randomness](transforms.md#forward-time-randomness--selfrng-and-dropout).
 
 Usage in a module:
 

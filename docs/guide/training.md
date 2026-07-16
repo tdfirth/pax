@@ -128,6 +128,13 @@ one eval program — cached and reused thereafter. In the eval branch BatchNorm 
 the running statistics instead of the batch and records no buffer write, so
 `new_state["buffers"]` equals what you passed in.
 
+Because `training` is the **global** `flags` namespace, one switch drives every
+layer that reads it. Add a `pax.layers.Dropout` and the same `Static({"training":
+False})` puts BatchNorm into eval *and* turns Dropout into the identity — no
+per-layer bookkeeping. Dropout draws its mask from a forward-time `rng` leaf, so
+like buffers it lives in `new_state` (under `state["rng"]`) and must be threaded
+to advance the mask; see [transforms — forward-time randomness](transforms.md#forward-time-randomness--selfrng-and-dropout).
+
 ## Selective training — `freeze` and `select`
 
 To train only part of a model, mark the rest **frozen** with `pax.freeze`, which

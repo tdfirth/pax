@@ -167,4 +167,5 @@ class Static:
 # Built-in namespaces (contract §2.1).
 params = namespace("params")  # traced, scoped — the default for bare arrays
 buffer = namespace("buffers")  # traced, scoped — e.g. BatchNorm running stats
+rng = namespace("rng")  # traced, scoped — forward-time PRNG leaf, threads through state
 flags = namespace("flags", static=True, scoped=False)  # static, global — mode flags

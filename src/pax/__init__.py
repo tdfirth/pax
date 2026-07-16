@@ -11,7 +11,7 @@ from __future__ import annotations
 from . import layers
 from .combinators import parallel, repeat, sequential
 from .module import Module
-from .namespaces import Static, buffer, flags, namespace
+from .namespaces import Static, buffer, flags, namespace, rng
 from .paths import freeze, select
 from .random import seed
 
@@ -25,6 +25,7 @@ __all__ = [
     "namespace",
     "parallel",
     "repeat",
+    "rng",
     "seed",
     "select",
     "sequential",

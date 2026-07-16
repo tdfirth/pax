@@ -22,9 +22,11 @@ interfaces that fan out.
 state extraction, `forward`, `self.key()` + `pax.seed`, and the static/traced +
 scoped/global state partitioning.
 
-**Deferred to v2 (designed, not built):** forward-time RNG (`self.rng()`,
-Dropout), Conv, `@compact`-style lazy shape inference, module-level vmap
-(stacked params), tabulation.
+**Deferred to v2 (designed, not built):** Conv, `@compact`-style lazy shape
+inference, module-level vmap (stacked params), tabulation.
+
+**Implemented (was v2):** forward-time RNG (`self.rng()` + the `rng` namespace)
+and `Dropout` — see §7.
 
 **Never in scope (JAX already does it):** backprop, optimizer updates, optimizer
 state, JIT, vmap, scan. Pax owns exactly two jobs: *declare/initialize state*
@@ -125,6 +127,7 @@ Built-ins shipped by Pax:
 
 ```python
 buffer = namespace('buffers')                          # traced, scoped
+rng    = namespace('rng')                              # traced, scoped — forward-RNG leaf (§7)
 flags  = namespace('flags', static=True, scoped=False) # static,  global
 ```
 
@@ -460,27 +463,62 @@ process-global would.
 
 ---
 
-## 7. Deferred: forward-time RNG (v2, designed here for continuity)
+## 7. Forward-time RNG (`self.rng()`) + Dropout
 
-Not built in v1, but the design is fixed so buffers/collection don't need
-rework later:
+Randomness *during* `forward` is a traced, scoped `rng` namespace — a real
+pytree leaf that threads through state — plus a `Module.rng()` method:
 
 ```python
 rng = namespace('rng')   # traced, scoped — a real pytree leaf that threads through
 
 class Module:
     def rng(self) -> PRNGKey:
-        # split this module's rng leaf; write the advanced half back into state
-        # (collected by forward like any buffer write); return a fresh subkey.
+        # split this module's single rng leaf (found by namespace, not name);
+        # write the advanced half back into state (collected by forward like any
+        # buffer write); return a fresh subkey. Forward-time only.
         ...
 ```
+
+Seed the leaf at init from the init-PRNG, under **any name except `rng`** (a bare
+`rng` attribute would shadow the method on read):
+
+```python
+class Dropout(Module):
+    def __init__(self, p: float = 0.5) -> None:
+        self.p = p
+        self.rng_key = rng(self.key())   # forward-RNG leaf, seeded from init PRNG
+        self.training = flags(True)      # shares the global `training` flag
+
+    def __call__(self, x):
+        if not self.flags.training or self.p == 0.0:
+            return x
+        keep = 1.0 - self.p
+        mask = jax.random.bernoulli(self.rng(), keep, x.shape)
+        return x * mask / keep           # inverted dropout: no eval-time scaling
+```
+
+Semantics of `self.rng()`:
+
+- **Forward-time only** — calling it outside `forward` raises. It reads and
+  writes through the ordinary `getattr`/`setattr` routing, so the split key rides
+  the §5.4 write-collection path and lands in `new_state['rng']`.
+- It operates on the module's **single** `rng` leaf, located **by namespace**;
+  zero leaves or more than one both raise (declare exactly one).
+- Because the key is an explicit pytree leaf, `forward` stays **pure**:
+  identical input state produces the identical mask; threading `new_state`
+  advances the key, so the mask differs on the next call. This is what makes it
+  correct under `jit` (one mask per state), `scan` (mask differs per step as the
+  key threads through the carry), `vmap` (map a batch of keys for a per-row mask;
+  a single broadcast leaf gives the same mask on every row), and `grad`
+  (differentiable w.r.t. `x` — gradient flows through the kept units).
 
 Rationale (why it can't reuse `self.key()`): forward runs *inside* `jit`/`vmap`/
 `scan` and must stay pure, so its randomness must be an explicit pytree leaf that
 is split-and-written-back each call — not an ambient thread-local. Mechanically
-it is "a `buffer` write plus a split," which is exactly why it's cheap to add
-once the §5.4 write-collection path is proven. Dropout ships on top of this in
-v2.
+it is "a `buffer` write plus a split," which is why it drops onto the proven
+§5.4 write-collection path. `Dropout` ships on top of it; because `training` is
+the **global** `flags` namespace, one switch drives both `Dropout` and
+`BatchNorm` in a composed model.
 
 ---
 

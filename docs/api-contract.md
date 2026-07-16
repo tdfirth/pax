@@ -1,10 +1,11 @@
 # Pax — Core API Contract (v1)
 
-> **Status: FROZEN (v1).** This is the interface that Phase-2 subagents (layers,
-> combinators, path utils, docs, integration tests) build against. All three
-> open decisions (D1/D2/D3) are resolved — see §11. Every signature and semantic
-> rule here is normative. Changes require re-opening the contract, not a local
-> patch in a sub-package.
+> **Status: v1, stable.** This is the interface that layers, combinators, path
+> utils, docs, and integration tests build against. The three original decisions
+> (D1/D2/D3) plus the init-time guards (G1/G2/G3) from implementation review are
+> resolved — see §11. Every signature and semantic rule here is normative; it is
+> kept in sync with the implementation rather than patched locally in a
+> sub-package.
 
 This document specifies **what the core provides**, precisely enough that a layer
 or combinator author never has to read the core implementation. It is organized
@@ -28,6 +29,13 @@ Dropout), Conv, `@compact`-style lazy shape inference, module-level vmap
 **Never in scope (JAX already does it):** backprop, optimizer updates, optimizer
 state, JIT, vmap, scan. Pax owns exactly two jobs: *declare/initialize state*
 and *route state during the forward pass*.
+
+**Pax only *adds* to JAX — it never wraps or replaces it.** Anything that
+manipulates arrays stays raw `jax.*` in both code and examples: weight init is
+`jax.random.normal(self.key(), ...)`, not a `pax.random` re-export (`pax.random`
+is the init-seed context, a genuinely new capability, not a shadow of
+`jax.random`). Re-exporting JAX would reintroduce the framework boundary Pax
+exists to remove.
 
 ---
 
@@ -123,10 +131,10 @@ flags  = namespace('flags', static=True, scoped=False) # static,  global
 Usage:
 
 ```python
-self.W            = random.normal(self.key(), (i, o)) * 0.01  # -> params (bare array)
+self.W            = jax.random.normal(self.key(), (i, o)) * 0.01  # -> params (bare array)
 self.running_mean = buffer(jnp.zeros(d))                      # -> buffers
 self.training     = flags(True)                               # -> flags
-self.embed        = shared(random.normal(self.key(), (v, d))) # -> shared (global)
+self.embed        = shared(jax.random.normal(self.key(), (v, d))) # -> shared (global)
 ```
 
 ### 2.2 `Static` — how static namespaces survive `jax.jit`
@@ -182,7 +190,7 @@ states" flags.
 ```python
 class Linear(Module):
     def __init__(self, in_f, out_f):        # NO super().__init__() needed
-        self.W = random.normal(self.key(), (in_f, out_f)) * 0.01
+        self.W = jax.random.normal(self.key(), (in_f, out_f)) * 0.01
         self.b = jnp.zeros(out_f)
 
     def __call__(self, x):                  # takes only x; reads state via self
@@ -258,7 +266,18 @@ Extracts a fresh state pytree from the module tree (walks children, collects eac
 namespace's init values into the layout of §1). With `key=`, **re-materializes**
 params/traced state deterministically from that key instead of the values fixed
 at construction (Option A escape hatch; see §6). Static namespaces are wrapped in
-`Static` nodes. `params` is always present.
+`Static` nodes. `params` is always present. Top-level namespace keys are emitted
+in a deterministic (sorted) order.
+
+**`key=` re-materialization replays construction** under the given key: it
+reruns `type(self)(*ctor_args)` in a `seed`-like context. This faithfully redraws
+every child a module builds *inside* its own `__init__` (the common case). It
+**cannot** faithfully re-materialize a module built from **pre-existing child
+instances** — every combinator (`sequential`/`repeat`/`parallel`) and any module
+taking a `Module` argument — because replay would reuse the same child objects
+and leave their params at the original draw. That case **raises** rather than
+silently returning stale values; construct the whole model under
+`with pax.seed(k):` to reseed it.
 
 ### `forward(state, x) -> (new_state, y)`
 
@@ -326,9 +345,10 @@ bound (len(_bound) > 0)          -> forward-time WRITE: record under the
                                     registered namespace of `name` (D3: raise if
                                     unregistered); do not touch the instance
 unbound (init):
-    value is Tagged              -> registry[name]=value.ns; _init_values[name]=value.value
-    value is Module              -> _children[name]=value
-    value is jax.Array           -> registry[name]='params'; _init_values[name]=value
+    value is Module              -> _children[name]=value  (guards G1, G2)
+    value is Tagged              -> registry[name]=value.ns; _init_values[name]=value.value  (guard G2)
+    value is jax.Array           -> registry[name]='params'; _init_values[name]=value  (guard G2)
+    value is a non-jax array-like -> raise TypeError (guard G3)
     else                         -> object.__setattr__ (plain config)
 ```
 
@@ -336,6 +356,29 @@ Parameters and buffers are stored in `_init_values`, **not** as real instance
 attributes — that's what makes normal lookup miss and route through `__getattr__`
 so reads can be redirected to bound state. Config (ints/floats/etc.) is a real
 attribute and never routes.
+
+**Init-time guards.** Every classification failure here is otherwise a *silent*
+wrong result (a weight dropped from state, a tied weight that reads the wrong
+slice) — the same failure class D3 exists to prevent. So init-time raises early:
+
+- **G1 — instance aliasing.** Assigning the *same* `Module` instance under two
+  different attribute names raises. Two names would push two frames onto that one
+  instance's `_bound` stack and both reads resolve to the top of stack, silently
+  reading the wrong slice. Tie weights via a **global namespace** (`shared`), or
+  repeat a layer with `pax.repeat` — never by instance reuse.
+- **G2 — name/category collision.** Reusing one attribute name across categories
+  (e.g. a param name later reassigned as a child module, or vice versa) raises,
+  rather than leaving the name in two registries where collection silently picks
+  one. Re-assigning the *same* category/name is fine (last value wins).
+- **G3 — non-jax array-like.** Assigning a value that is array-like but not a
+  `jax.Array` (a NumPy `ndarray`, a NumPy scalar — anything with `__array__`)
+  raises `TypeError`. Such a value would fall to the `else` branch and become a
+  silent config attribute: absent from `state`, untraced, no gradients. Assign a
+  JAX array (`jnp.*` / `jax.random.*`, seeded via `self.key()`) or tag it for a
+  namespace. Genuine config (`int`/`float`/`str`/`tuple`) is unaffected.
+
+Double-tagging (`buffer(buffer(x))`) likewise raises at the tagger (§2.1), so a
+`Tagged` never becomes another namespace's stored *value*.
 
 ### 5.3 `_bind(state_slice)` — top-down
 
@@ -389,7 +432,7 @@ with pax.seed(0):
 state = model.state()           # extract; no key arg required (matches spec)
 
 # escape hatch: re-materialize under a different key
-state = model.state(key=random.key(42))
+state = model.state(key=jax.random.key(42))
 ```
 
 Public surface:
@@ -401,7 +444,7 @@ def seed(n: int) -> ContextManager       # pax.seed(0): sets the thread-local in
 Mechanism:
 
 - A **thread-local** holds the current init key. `pax.seed(n)` sets it to
-  `random.key(n)` on entry and restores the previous value on exit (nestable).
+  `jax.random.key(n)` on entry and restores the previous value on exit (nestable).
 - `Module.__new__` pulls a per-module key by splitting the thread-local
   (advancing it so sibling modules differ). `self.key()` splits `self._key`
   per parameter.
@@ -475,15 +518,28 @@ Because scoped-namespace keys are meaningful strings, path-glob selection over a
 namespace dict is natural. v1 surface:
 
 ```python
-def freeze(tree: dict, pattern: str) -> dict         # e.g. freeze(state['params'], 'embed.*')
-def select(tree: dict, pattern: str) -> dict         # subtree matching a glob path
+def match_path(pattern: str, path: str) -> bool      # the shared glob primitive
+def select(tree: dict, pattern: str) -> dict         # pruned subtree of matching leaves
+def freeze(tree: dict, pattern: str) -> dict         # boolean mask marking matches
 ```
 
-Patterns are dot-paths with `*` wildcards matching one segment (`blocks.*.attn.*`).
-Operates on a single namespace's dict (typically `state['params']`), returns a
-pytree of the same shape. Exact freeze semantics (stop-gradient vs. mask vs.
-partition) is an implementation detail owned by the utils task, but the **glob
-matcher is shared** and specified here so layers/tests can rely on it.
+Patterns are dot-paths with `*` wildcards matching **exactly one segment**
+(`blocks.*.attn.*`). Matching is **whole-path**: pattern and path are split on
+`.` and must have the **same number of segments**, matched pairwise. Consequences
+(intentional, kept simple for v1):
+
+- `*` never spans a `.`; there is no multi-segment wildcard.
+- No prefix matching — a short pattern does not match a deeper path. So you
+  cannot freeze a whole subtree with `blocks.0`; match at the exact leaf depth
+  (`blocks.0.attn.*`, or one pattern per depth). `select`/`freeze` therefore only
+  ever match true leaves whose full dot-path length equals the pattern length.
+
+`select` returns a pytree of the same nesting restricted to matching leaves
+(non-matching branches pruned). `freeze` returns a **boolean-mask pytree** of the
+same shape as `tree` (`True` at frozen/matched leaves), which composes directly
+with `optax.masked` / `optax.multi_transform` and round-trips through
+`jax.tree_util`. Both operate on a single namespace's dict (typically
+`state['params']`); the `match_path` primitive is the one source of truth.
 
 ---
 
@@ -511,7 +567,19 @@ matcher is shared** and specified here so layers/tests can rely on it.
   spec's bare-`self.embed`-in-`Decoder` example is corrected. *(§3)*
 - **D3** — forward-time write to an **unregistered** name **raises.** *(§3)*
 
-Contract is **FROZEN**. Phase 2 may fan out.
+Init-time guards added after implementation review — each turns a *silent* wrong
+result into an early raise (§5.2):
+
+- **G1** — assigning one `Module` **instance under two names raises** (state
+  aliasing); tie weights via a global namespace or `pax.repeat`.
+- **G2** — reusing an attribute **name across param/child categories raises**.
+- **G3** — assigning a **non-jax array-like** (NumPy `ndarray`/scalar) as a
+  weight **raises**; use a `jax.Array` or a namespace tagger.
+- **`state(key=...)`** re-materializes by replaying construction; it **raises**
+  for modules built from pre-existing child instances (combinators, child-arg
+  ctors) instead of returning stale values (§4).
+- **`jax.random` convention** — array ops (init included) use raw `jax.*`; Pax
+  only adds, never wraps (§0).
 
 ### Worked example — tied weights (post-D2)
 
@@ -520,7 +588,7 @@ shared = namespace('shared', scoped=False)   # traced, global -> one copy in sta
 
 class Encoder(Module):
     def __init__(self, vocab, d):
-        self.embed = shared(random.normal(self.key(), (vocab, d)))  # declares embed
+        self.embed = shared(jax.random.normal(self.key(), (vocab, d)))  # declares embed
     def __call__(self, x):
         return self.embed[x]                    # rule 2: its own declared attr
 

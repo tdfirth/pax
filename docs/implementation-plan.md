@@ -1,6 +1,6 @@
 # Pax — Implementation Plan
 
-Companion to `docs/api-contract.md` (**FROZEN v1**). That contract is the single
+Companion to `docs/api-contract.md` (**v1, stable**). That contract is the single
 source of truth for every signature and semantic rule; this plan is the work
 breakdown and the parallelization strategy.
 

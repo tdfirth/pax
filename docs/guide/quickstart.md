@@ -98,6 +98,17 @@ BatchNorm's running statistics, say — return their updated values in
 `(carry, x) -> (carry, y)` shape you'd write for a `scan` (not a coincidence —
 see [transforms](transforms.md)).
 
+> **What `new_state` carries — and when you can ignore it.** `new_state` holds
+> the *forward-time* writes: a BatchNorm's updated running stats, a Dropout's
+> advanced RNG key, a growing KV cache. It does **not** carry updated params —
+> params never change inside `forward` (you never assign `self.W` in `__call__`);
+> they change in the optimizer, in the next section. So for a model that writes
+> no such state, `new_state` is just `state` echoed back, and discarding it with
+> `_, y = model.forward(...)` is lossless — which is why the training step below
+> does exactly that. The moment a model *is* stateful, you must thread
+> `new_state` forward or those updates are silently lost; the
+> [training guide](training.md#stateful-layers-threading-new_state) shows how.
+
 ## 4. Compile it with `jit`
 
 Because `forward` is a pure function of `(state, x)`, and the model holds no
@@ -131,7 +142,7 @@ opt = optax.adam(1e-3)
 opt_state = opt.init(state["params"])
 
 @jax.jit
-def train_step(params, opt_state, x, targets):
+def train_step(params, opt_state, state, x, targets):
     loss, grads = jax.value_and_grad(loss_fn)(params, state, x, targets)
     updates, opt_state = opt.update(grads, opt_state)
     params = optax.apply_updates(params, updates)
@@ -139,13 +150,22 @@ def train_step(params, opt_state, x, targets):
 
 targets = jnp.zeros((3, 8))
 params = state["params"]
-params, opt_state, loss = train_step(params, opt_state, x, targets)
+params, opt_state, loss = train_step(params, opt_state, state, x, targets)
 ```
 
 `jax.grad` differentiates its *first* argument, so making `params` first means
 you differentiate params alone; everything else in `state` is held constant. And
 because `grads` comes back with the exact structure of `state["params"]`, optax
 consumes it with no adaptation — no framework glue in sight.
+
+Note that `state` is passed **in as an argument**, not captured from the
+enclosing scope. It's tempting to let `train_step` close over the outer `state`,
+but threading it explicitly keeps the step a self-contained pure function of its
+inputs — and it's what you'll need anyway the moment `state` carries buffers you
+update each step (the [training guide](training.md) does exactly this). Here
+`state` provides only the non-param namespaces; `loss_fn` splices the live
+`params` over the top with `{**state, "params": params}`, so the params inside
+the passed-in `state` are never read.
 
 If a layer also writes buffers, you thread `new_state["buffers"]` back into the
 `state` you pass on the next step; the params-only gradient path above is

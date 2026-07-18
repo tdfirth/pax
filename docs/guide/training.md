@@ -1,9 +1,10 @@
 # Training
 
-Pax owns *state*; **optax owns optimization**. A training loop is plain JAX and
-optax operating on the plain pytrees `model.state()` returns — Pax adds no
-`Trainer`, no `apply`, no wrapper. This page builds the loop end to end, then
-covers stateful layers (BatchNorm), eval mode, and freezing part of the model.
+Pax owns your model's *state*; **optax owns optimization.** There is no `Trainer`,
+no `.fit()`, no `apply` — a training loop is plain JAX and optax operating on the
+plain pytrees `model.state()` hands you. This page builds that loop end to end,
+then covers the three things real models add: stateful layers (BatchNorm), eval
+mode, and freezing part of the model.
 
 ## The pieces
 
@@ -20,15 +21,15 @@ with pax.seed(0):
 state = model.state()          # {'params': {...}} — a plain nested dict of arrays
 ```
 
-Two facts drive everything below:
+Two facts (both from earlier pages) drive everything below:
 
 - `forward(state, x) -> (new_state, y)` is a **pure** function of `(state, x)`;
-  the module holds no traced arrays between calls, so you `jit`/`grad` it directly
-  (see [transforms](transforms.md)).
-- Gradients are taken **with respect to `params` only**. Make `params` the
+  the model holds no traced arrays between calls, so you `jit` and `grad` it
+  directly (see [transforms](transforms.md)).
+- Gradients are taken **with respect to `params` only**. You make `params` the
   differentiated argument and splice it back into the full state with
-  `{**state, "params": p}` (contract §4). Buffers and flags are held constant
-  because they aren't the differentiated argument.
+  `{**state, "params": p}`. Buffers and flags ride along in `state` but are held
+  constant, because they aren't what's being differentiated.
 
 ## A jitted training step
 
@@ -54,15 +55,18 @@ for _ in range(100):
 ```
 
 `grads` has exactly the structure of `state["params"]`, so optax consumes it with
-no adaptation. `state` (buffers, flags) is captured as a constant here because this
-model writes no buffers — the next section threads them when it must.
+no adaptation. Here `state` (its buffers, flags) is captured as a constant, which
+is fine because this model writes no buffers. The next section handles the case
+where it does. A complete runnable version of this is
+[`examples/mlp.py`](../../examples/mlp.py).
 
 ## Stateful layers: threading `new_state`
 
-A layer that writes state during `forward` — a `BatchNorm` updating running
-statistics — returns the new values in `new_state["buffers"]`. Buffers are **not**
-differentiated, but they **must be threaded** from step to step. Take them off
-`new_state` (via `has_aux`) and pass them back in on the next step:
+A layer that writes state during `forward` — a `BatchNorm` updating its running
+statistics — returns the updated values in `new_state["buffers"]`. Buffers are
+**not** differentiated, but they **must be carried forward** from step to step,
+or your running stats never move. The pattern: pull them off `new_state` (via
+`has_aux`) and pass them back in on the next step.
 
 ```python
 from pax.layers import BatchNorm
@@ -100,18 +104,18 @@ params, buffers = state["params"], state["buffers"]
 params, buffers, opt_state, loss = train_step(params, buffers, opt_state, x, targets)
 ```
 
-`buffers` carries the running statistics forward across steps; `grads` still
-covers `params` alone. The `flags` namespace stays constant in `state` — the
-`training` flag is `True`, so BatchNorm takes its train branch and writes the
-buffers.
+`buffers` now carries the running statistics forward across steps; `grads` still
+covers `params` alone. `flags` stays constant in `state` — `training` is `True`,
+so BatchNorm takes its train branch and writes the buffers. See
+[`examples/batchnorm.py`](../../examples/batchnorm.py) for the full loop plus a
+check that it recompiles exactly once.
 
 ## Train vs. eval — the `flags` namespace
 
 BatchNorm's `training` lives in the static, global `flags` namespace: it rides in
-the treedef (`pax.Static`), so it is a concrete Python `bool` inside the trace and
-part of the `jit` compile-cache key (see [namespaces](namespaces.md) and
-[transforms — static under jit](transforms.md#static-namespaces-under-jit)). Flip
-it for evaluation by swapping in a new `Static`:
+the treedef, so inside a trace it's a concrete `bool` and it's part of the `jit`
+compile-cache key (see [namespaces](namespaces.md#why-static-flags-survive-jit)).
+You flip it for evaluation by swapping in a new `Static`:
 
 ```python
 eval_state = {
@@ -124,23 +128,23 @@ _, preds = model.forward(eval_state, x)     # uses running stats; writes no buff
 ```
 
 Under `jit`, the two flag values produce **two compilations** — one train program,
-one eval program — cached and reused thereafter. In the eval branch BatchNorm reads
-the running statistics instead of the batch and records no buffer write, so
-`new_state["buffers"]` equals what you passed in.
+one eval program — cached and reused after that. In the eval branch BatchNorm
+reads the running statistics instead of the batch and records no buffer write, so
+`new_state["buffers"]` comes back equal to what you passed in.
 
-Because `training` is the **global** `flags` namespace, one switch drives every
-layer that reads it. Add a `pax.layers.Dropout` and the same `Static({"training":
-False})` puts BatchNorm into eval *and* turns Dropout into the identity — no
-per-layer bookkeeping. Dropout draws its mask from a forward-time `rng` leaf, so
-like buffers it lives in `new_state` (under `state["rng"]`) and must be threaded
-to advance the mask; see [transforms — forward-time randomness](transforms.md#forward-time-randomness--selfrng-and-dropout).
+And because `training` is a **global** flag, one switch drives *every* layer that
+reads it. Add a `pax.layers.Dropout` to the model and the same
+`Static({"training": False})` puts BatchNorm into eval mode *and* turns Dropout
+into the identity — no per-layer bookkeeping. (Dropout draws its mask from a
+forward-time `rng` leaf, which — like buffers — lives in `new_state` and must be
+threaded to advance the mask; see
+[transforms → forward-time randomness](transforms.md#forward-time-randomness--selfrng-and-dropout).)
 
 ## Selective training — `freeze` and `select`
 
-To train only part of a model, mark the rest **frozen** with `pax.freeze`, which
-returns a boolean-mask pytree of the same shape as `state["params"]` (`True` at
-matched leaves). It composes directly with `optax.masked` and
-`optax.multi_transform` (contract §9):
+To train only part of a model, mark the rest **frozen**. `pax.freeze` returns a
+boolean-mask pytree of the same shape as `state["params"]` — `True` at the leaves
+you matched — which drops straight into optax:
 
 ```python
 with pax.seed(1):
@@ -157,9 +161,10 @@ opt = optax.chain(tx, optax.adam(1e-3))
 opt_state = opt.init(params)
 ```
 
-Patterns are whole-path globs where `*` matches **exactly one segment**; there is
-no prefix matching, so match at the exact leaf depth (`Linear_0.*`, not
-`Linear_0`). Equivalently, partition with `multi_transform`:
+One thing to know about the patterns: they're **whole-path globs** where `*`
+matches *exactly one* path segment. There's no prefix matching, so you match at
+the exact leaf depth — `Linear_0.*` (matching `Linear_0.W` and `Linear_0.b`), not
+`Linear_0` on its own. Equivalently, you can partition with `multi_transform`:
 
 ```python
 labels = jax.tree_util.tree_map(lambda frozen: "frozen" if frozen else "train", mask)
@@ -169,16 +174,15 @@ tx = optax.multi_transform(
 ```
 
 `pax.select` is the companion for **reading** a subtree — it returns just the
-matching leaves (non-matching branches pruned), handy for inspecting or
-checkpointing one part of the model:
+matching leaves, with non-matching branches pruned. Handy for inspecting or
+checkpointing one part of a model:
 
 ```python
 pax.select(params, "Linear_2.*")   # -> {'Linear_2': {'W': ..., 'b': ...}}
 ```
 
-Both operate on a single namespace's dict (typically `state["params"]`) and share
-one `match_path` primitive, so a mask and a selection always agree on which leaves
-match.
+Both operate on a single namespace's dict (usually `state["params"]`) and share
+the same matcher, so a mask and a selection always agree on which leaves match.
 
 ## Reproducibility
 
@@ -197,11 +201,12 @@ state_a = model.state()
 state_b = model.state(key=jax.random.key(42))   # same model, freshly drawn params
 ```
 
-It has one limitation to know: it **raises** for any model built from pre-existing
-child instances — every combinator (`sequential` / `repeat` / `parallel`) and any
-module taking a `Module` argument — because replaying construction would reuse
-those children and leave their params at the original draw (contract §4). For those
-models, reseed by rebuilding under a fresh context instead:
+It has one limitation worth knowing: it **raises** for any model built from
+pre-existing child instances — every combinator (`sequential` / `repeat` /
+`parallel`), and any module that takes a `Module` as a constructor argument —
+because replaying construction would reuse those same child objects and leave
+their params at the original draw. For those models, reseed by simply rebuilding
+under a fresh context:
 
 ```python
 with pax.seed(42):

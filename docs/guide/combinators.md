@@ -1,18 +1,21 @@
 # Combinators
 
-Combinators are **functions** that return a `Module` whose children are the layers
-you pass in (contract §8). They exist for the common wiring patterns — chaining,
-repeating, branching — and integrate with binding/collection like any other
-module, so `state()` / `forward` / `jit` all work unchanged. Pax ships three:
+Most models are built from smaller layers wired together in a few standard
+shapes: a chain, a repeated stack, a set of parallel branches. Combinators are
+**functions that build those wirings for you**, returning a `Module` whose
+children are the layers you passed in. Because the result is an ordinary module,
+`state()` / `forward` / `jit` all work on it unchanged.
+
+Pax ships three:
 
 ```python
 pax.sequential(*layers)   # thread x through each layer in order
-pax.repeat(layer, n)      # n weight-tied applications of ONE layer (via scan)
+pax.repeat(layer, n)      # apply ONE layer n times, weight-tied (via scan)
 pax.parallel(*layers)     # apply each layer to the input; return a tuple
 ```
 
 Each accepts `Module` instances **and** bare callables. Construct them under a
-seed like any module:
+seed, like any module:
 
 ```python
 import jax
@@ -29,24 +32,24 @@ new_state, y = model.forward(state, jnp.ones((3, 4)))   # y: f32[3, 2]
 
 ## Bare callables pass through
 
-A layer that carries no state — an activation like `jax.nn.relu`, or any
-`x -> y` function — is detected via `not isinstance(x, Module)` and invoked
-directly. It gets **no scope management, no name, and no entry in `state`**:
+Notice `jax.nn.relu` in that chain — a plain function, not a `Module`.
+Combinators detect anything that isn't a `Module` and simply call it: no scope
+management, no name, and **no entry in `state`**.
 
 ```python
 list(state["params"].keys())   # ['Linear_0', 'Linear_2']
 ```
 
-`relu` sat at position 1 but owns no params, so only the two `Linear` children
-appear. This is why you write activations inline rather than wrapping them —
-there is nothing to store.
+`relu` sat at position 1 but owns no weights, so only the two `Linear` children
+show up. This is exactly why you write activations inline instead of wrapping them
+in a layer — there's nothing to store.
 
-## Positional `ClassName_N` naming
+## How unnamed children get their keys
 
-Children you don't name explicitly get a positional key `ClassName_N`, where `N`
-is the layer's index in the call (contract §5.5). The index is the position in
-the full argument list, so the `relu` above consumes index 1 and the second
-`Linear` is `Linear_2`:
+The `Linear_0` / `Linear_2` above are **positional names**: a child you don't
+assign to a named attribute gets the key `ClassName_N`, where `N` is its index in
+the argument list. `relu` consumed index 1, so the second `Linear` is `Linear_2`,
+not `Linear_1`:
 
 ```python
 state["params"] == {
@@ -55,15 +58,16 @@ state["params"] == {
 }
 ```
 
-Two layers of the same class are disambiguated by index (`Linear_0`, `Linear_2`),
-never by instance identity — reusing one instance twice is a guard error (G1), not
-a way to share weights. To share weights, use `repeat` (below) or a global
-`shared` namespace (see [namespaces](namespaces.md#tied-weights--the-global-shared-namespace)).
+Two layers of the same class are told apart by index (`Linear_0`, `Linear_2`),
+never by object identity. Passing the *same* instance twice is an error, not a way
+to share weights — if you want weight sharing, use `repeat` (below) or a global
+`shared` namespace (see
+[namespaces → tied weights](namespaces.md#tied-weights--the-global-shared-namespace)).
 
 ## `parallel` — branch, return a tuple
 
 `parallel` applies **every** layer to the same input and returns a tuple of their
-outputs (contract §8):
+outputs:
 
 ```python
 with pax.seed(1):
@@ -74,15 +78,15 @@ _, (a, b) = heads.forward(state, jnp.ones((3, 4)))
 a.shape, b.shape                            # (3, 8), (3, 2)
 ```
 
-Combine it with a bare callable to merge the branches yourself downstream (e.g.
-concatenate in an enclosing module's `__call__`).
+Combine it with a bare callable — or just handle the tuple in an enclosing
+module's `__call__` — to merge the branches yourself (e.g. concatenate them).
 
 ## `repeat` — weight-tied depth via `scan`
 
-`repeat(layer, n)` applies **one** layer `n` times, sharing a single parameter
-copy across all applications (weight-tied). It registers the layer once — so state
-holds exactly one copy under `Linear_0` — and drives the `n` applications with
-`jax.lax.scan` internally for memory efficiency:
+`repeat(layer, n)` applies **one** layer `n` times, sharing a *single* copy of its
+parameters across all `n` applications. It registers the layer once — so state
+holds exactly one copy — and drives the applications with `jax.lax.scan`
+internally, which keeps memory flat regardless of depth:
 
 ```python
 with pax.seed(2):
@@ -94,8 +98,8 @@ list(state["params"].keys())               # ['Linear_0']  — ONE copy, not thr
 list(state["params"]["Linear_0"].keys())   # ['W', 'b']
 ```
 
-`n` applications of the tied layer are exactly `n` manual applies of that single
-param copy:
+Those `n` applications of the tied layer are exactly `n` manual applies of that
+one param copy:
 
 ```python
 x = jnp.ones((3, 4))
@@ -109,14 +113,14 @@ for _ in range(3):
 jnp.allclose(y, h)                          # True
 ```
 
-Use `repeat` for a homogeneous stack (transformer blocks, residual layers) where
-every layer should share weights. For **distinct** weights per layer, list them in
-`sequential` instead — that gives you `TransformerBlock_0`, `TransformerBlock_1`, …
-each with its own params.
+Reach for `repeat` when every layer in a stack *should* share weights. When you
+want **distinct** weights per layer instead — the usual case for transformer
+blocks — list them in `sequential`, which gives you `TransformerBlock_0`,
+`TransformerBlock_1`, … each with its own params.
 
-## A real composed model
+## Combinators nest
 
-Combinators nest, so a small classifier is a one-liner:
+They're just modules, so they compose. A small classifier is a one-liner:
 
 ```python
 from pax.layers import Linear, BatchNorm
@@ -133,16 +137,18 @@ state = model.state()
 # state == {'params': {...}, 'buffers': {...}, 'flags': Static({'training': True})}
 ```
 
-`BatchNorm` pulls `buffers` and `flags` into the state pytree; the combinator
-routes each namespace to the right child automatically (contract §5.3). Training
-this model — params-only gradients, threading buffers, flipping the flag for eval —
-is covered in [training](training.md).
+`BatchNorm` pulls `buffers` and `flags` into the state pytree, and the combinator
+routes each namespace to the right child automatically — you never wire the
+buffers or the flag by hand. Actually *training* this model — params-only
+gradients, threading the buffers, flipping the flag for eval — is the subject of
+the [training guide](training.md).
 
 ## When you don't need a combinator
 
-Combinators are convenience, not necessity (contract §8). Anything with data flow
-that isn't a straight chain, a branch, or a tied repeat is just **plain Python in
-`__call__`** — no combinator, no special API. A residual block:
+Combinators are convenience, not necessity. Anything whose data flow *isn't* a
+straight chain, a branch, or a tied repeat is just **plain Python in `__call__`**
+— no combinator, no special API. A residual block, for instance, is a one-line
+`__call__`:
 
 ```python
 from pax.layers import Linear, LayerNorm
@@ -156,6 +162,7 @@ class Residual(pax.Module):
         return x + self.lin(self.norm(x))    # the skip connection is just `+`
 ```
 
-Children get their **user-assigned** names as keys (`norm`, `lin`), and `self.lin`
-resolves to the bound child during `forward`. Reach for a combinator only when it
-reads more clearly than the equivalent loop or expression.
+Children assigned to named attributes get those names as keys (`norm`, `lin`), and
+`self.lin` resolves to the bound child during `forward` — exactly like reading a
+param. Use a combinator only when it reads more clearly than the equivalent loop
+or expression; otherwise, write the Python.
